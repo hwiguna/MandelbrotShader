@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandelbrot Sphere</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #hud {
+    position: fixed; left: 12px; bottom: 12px; padding: 8px 12px;
+    font: 12px/1.5 system-ui, sans-serif; color: #c8cbd6;
+    background: rgba(10, 12, 20, 0.7); border-radius: 6px; user-select: none;
+  }
+  #hud summary { cursor: pointer; color: #fff; font-weight: 600; }
+  #hud[open] summary { margin-bottom: 4px; }
+  #hud b { color: #fff; font-weight: 600; }
+  #status { color: #8fa3c8; }
+  #snap {
+    position: fixed; top: 12px; right: 12px; width: 44px; height: 44px; padding: 0;
+    display: grid; place-items: center; color: #e8ecf5; cursor: pointer;
+    background: rgba(10, 12, 20, 0.7); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px;
+  }
+  #snap:hover { background: rgba(40, 50, 75, 0.85); }
+  #snap.busy { cursor: progress; animation: pulse 0.8s ease-in-out infinite alternate; }
+  @keyframes pulse { from { opacity: 1; } to { opacity: 0.4; } }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="flash"></div>
+<button id="snap" title="Snapshot the sphere">
+  <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+    <path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/>
+    <circle cx="12" cy="13.5" r="3.5"/>
+  </svg>
+</button>
+<details id="hud" open>
+  <summary>Controls</summary>
+  <b>Left-drag</b> orbit &nbsp;·&nbsp; <b>Right-drag</b> / <b>Shift+drag</b> pan &nbsp;·&nbsp;
+  <b>Wheel</b> zoom &nbsp;·&nbsp; <b>Double-click</b> reset<br>
+  Hold <b>Ctrl</b> to act on the fractal: <b>left-drag</b> rotate &nbsp;·&nbsp; <b>right-drag</b> pan &nbsp;·&nbsp; <b>wheel</b> zoom<br>
+  <b>Tab</b> color cycling on/off &nbsp;·&nbsp; <b>↑ / ↓</b> cycle speed &nbsp;·&nbsp; <b>Camera icon</b> snapshot<br>
+  <span id="status"></span>
+</details>
+
+<script>
+const MAX_SNAPS = 16;     // snapshot spheres kept at once (oldest is replaced)
+const SNAP_SIZE = 1024;   // snapshot disk texture resolution
+const FLOOR_Y = -1.6;
+
+// ---- Shaders ----
+const VS = `#version 300 es
+// Fullscreen triangle; no vertex buffer needed.
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// Fractal coloring shared by the live sphere and the snapshot baker.
+// Two paths: plain float iteration when the pixel footprint is large enough, and perturbation
+// against a reference orbit computed in double precision on the CPU for deep zooms.
+const FRACTAL_GLSL = `
+uniform vec2  uCenter;      // complex-plane point at the disk center (float path only)
+uniform float uScale;       // complex-plane radius of each hemisphere disk
+uniform vec2  uRot;         // (cos, sin) of the fractal's rotation within the disk
+uniform int   uMaxIter;
+uniform int   uPerturb;     // 1 = use the reference orbit (deep zoom)
+uniform highp sampler2D uRef; // reference orbit Z[0..uRefLen], 1024 entries per row
+uniform int   uRefLen;
+uniform float uColorOffset; // palette phase, animated for color cycling
+
+vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+
+vec3 palette(float t) {
+  return 0.5 + 0.5 * cos(6.2831853 * (t + vec3(0.0, 0.10, 0.20)));
+}
+
+float smoothIter(int i, float m2) { return float(i) + 1.0 - log2(log2(m2) * 0.5); }
+
+// Smooth iteration count, or -1 if the point is in the set.
+float mandelDirect(vec2 c) {
+  // Skip the main cardioid and period-2 bulb.
+  float q = (c.x - 0.25) * (c.x - 0.25) + c.y * c.y;
+  if (q * (q + (c.x - 0.25)) < 0.25 * c.y * c.y) return -1.0;
+  if ((c.x + 1.0) * (c.x + 1.0) + c.y * c.y < 0.0625) return -1.0;
+
+  vec2 z = vec2(0.0);
+  for (int i = 0; i < 8192; i++) {
+    if (i >= uMaxIter) break;
+    z = cmul(z, z) + c;
+    float m2 = dot(z, z);
+    if (m2 > 256.0) return smoothIter(i, m2);
+  }
+  return -1.0;
+}
+
+vec2 refZ(int m) { return texelFetch(uRef, ivec2(m & 1023, m >> 10), 0).xy; }
+
+// Perturbation with rebasing: z = Z[m] + dz, where only the small offset dz lives on the GPU.
+float mandelPerturb(vec2 dc) {
+  vec2 dz = vec2(0.0);
+  int m = 0;
+  for (int i = 0; i < 8192; i++) {
+    if (i >= uMaxIter) break;
+    dz = cmul(2.0 * refZ(m) + dz, dz) + dc;
+    m++;
+    vec2 z = refZ(m) + dz;
+    float m2 = dot(z, z);
+    if (m2 > 256.0) return smoothIter(i, m2);
+    // Rebase when the orbit gets closer to 0 than to the reference, or the reference ran out.
+    if (m2 < dot(dz, dz) || m >= uRefLen) { dz = z; m = 0; }
+  }
+  return -1.0;
+}
+
+vec3 fractalColor(vec2 uv) {
+  vec2 d = uScale * vec2(uRot.x * uv.x - uRot.y * uv.y, uRot.y * uv.x + uRot.x * uv.y);
+  float it = uPerturb == 1 ? mandelPerturb(d) : mandelDirect(uCenter + d);
+  return it < 0.0 ? vec3(0.01, 0.01, 0.03) : palette(0.02 * it + 0.6 + uColorOffset);
+}
+`;
+
+const SCENE_FS = `#version 300 es
+precision highp float;
+precision highp int;
+${FRACTAL_GLSL}
+#define MAX_SNAPS ${MAX_SNAPS}
+
+uniform vec2  uRes;
+uniform vec3  uCamPos, uCamRight, uCamUp, uCamFwd;
+uniform float uTanHalfFov;
+uniform int   uAA;          // supersamples per axis
+uniform vec3  uSnapPos[MAX_SNAPS];
+uniform float uSnapLayer[MAX_SNAPS];
+uniform int   uSnapCount;
+uniform mediump sampler2DArray uSnaps;
+
+out vec4 outColor;
+
+const float FLOOR_Y = ${FLOOR_Y.toFixed(3)};
+const float SNAP_SIZE = ${SNAP_SIZE.toFixed(1)};
+const vec3 LIGHT = vec3(-0.4467, 0.7444, -0.4963);
+const vec3 AURA = vec3(0.45, 0.75, 1.0);
+
+vec3 sky(vec3 rd) {
+  return mix(vec3(0.03, 0.033, 0.045), vec3(0.004, 0.005, 0.01), clamp(rd.y * 1.5, 0.0, 1.0));
+}
+
+// Distance along the ray to a unit sphere at c, or negative on a miss.
+float hitSphere(vec3 ro, vec3 rd, vec3 c) {
+  vec3 oc = ro - c;
+  float b = dot(oc, rd);
+  float h = b * b - dot(oc, oc) + 1.0;
+  return h < 0.0 ? -1.0 : -b - sqrt(h);
+}
+
+// Soft shadow from a unit sphere (after Inigo Quilez).
+float sphereShadow(vec3 ro, vec3 rd, vec3 c) {
+  vec3 oc = ro - c;
+  float b = dot(oc, rd);
+  float h = b * b - dot(oc, oc) + 1.0;
+  float d = sqrt(max(0.0, 1.0 - h)) - 1.0;
+  float t = -b - sqrt(max(h, 0.0));
+  return t < 0.0 ? 1.0 : smoothstep(0.0, 1.0, 5.0 * d / t);
+}
+
+// Box-filtered checkerboard, w = pixel footprint in board units (after Inigo Quilez).
+float checker(vec2 p, float w) {
+  vec2 i = 2.0 * (abs(fract((p - 0.5 * w) * 0.5) - 0.5) - abs(fract((p + 0.5 * w) * 0.5) - 0.5)) / w;
+  return 0.5 - 0.5 * i.x * i.y;
+}
+
+vec3 render(vec2 frag) {
+  vec2 p = (2.0 * frag - uRes) / uRes.y;
+  vec3 rd = normalize(uCamFwd + uTanHalfFov * (p.x * uCamRight + p.y * uCamUp));
+  vec3 ro = uCamPos;
+  float pixAngle = 2.0 * uTanHalfFov / uRes.y;
+
+  // Nearest hit: -1 main sphere, 0.. snapshot, -3 floor, -2 nothing.
+  float tBest = 1e20;
+  int id = -2;
+  float t = hitSphere(ro, rd, vec3(0.0));
+  if (t > 0.0) { tBest = t; id = -1; }
+  for (int i = 0; i < MAX_SNAPS; i++) {
+    if (i >= uSnapCount) break;
+    t = hitSphere(ro, rd, uSnapPos[i]);
+    if (t > 0.0 && t < tBest) { tBest = t; id = i; }
+  }
+  if (rd.y < 0.0) {
+    t = (FLOOR_Y - ro.y) / rd.y;
+    if (t > 0.0 && t < tBest) { tBest = t; id = -3; }
+  }
+
+  vec3 col;
+  if (id == -2) {
+    col = sky(rd);
+  } else if (id == -3) {
+    vec3 pos = ro + tBest * rd;
+    float w = max(tBest * pixAngle / max(-rd.y, 0.02), 1e-4);
+    vec3 base = mix(vec3(0.85), vec3(0.03), checker(pos.xz, w));
+    float sh = sphereShadow(pos, LIGHT, vec3(0.0));
+    for (int i = 0; i < MAX_SNAPS; i++) {
+      if (i >= uSnapCount) break;
+      sh *= sphereShadow(pos, LIGHT, uSnapPos[i]);
+    }
+    col = base * (0.3 + 0.75 * sh * LIGHT.y);
+    col = mix(sky(rd), col, exp(-0.015 * tBest));
+  } else {
+    vec3 c = id == -1 ? vec3(0.0) : uSnapPos[id];
+    vec3 n = normalize(ro + tBest * rd - c);
+
+    // Pick hemisphere: western (x < 0) or eastern (x >= 0), each centered on its pole of the x axis.
+    // Stereographic projection from the opposite point maps the hemisphere onto the unit disk.
+    // The tangent basis is chosen so both copies look identical when viewed head-on from outside.
+    float s = n.x < 0.0 ? -1.0 : 1.0;
+    float denom = 1.0 + s * n.x;
+    vec2 uv = vec2(-s * n.z, n.y) / denom;
+
+    vec3 alb;
+    if (id == -1) {
+      alb = fractalColor(uv);
+    } else {
+      // Snapshots are baked disk textures; choose the mip level from the pixel footprint.
+      float foot = tBest * pixAngle / max(dot(n, -rd), 0.15) / denom;
+      float lod = log2(max(foot * SNAP_SIZE * 0.5, 1e-6));
+      vec3 v = textureLod(uSnaps, vec3(uv * 0.5 + 0.5, uSnapLayer[id]), lod).rgb;
+      alb = v * v;   // stored as sqrt to reduce 8-bit banding
+    }
+
+    // Thin seam along the meridian where the two hemispheres meet.
+    alb = mix(alb, vec3(0.9), smoothstep(0.004, 0.0, abs(n.x)) * 0.6);
+
+    float diff = max(dot(n, LIGHT), 0.0);
+    float spec = pow(max(dot(reflect(-LIGHT, n), -rd), 0.0), 40.0);
+    col = alb * (0.45 + 0.65 * diff) + 0.25 * spec;
+    if (id == -1) col += AURA * 0.6 * pow(1.0 - max(dot(n, -rd), 0.0), 2.5);
+  }
+
+  // Aura: glow around the main sphere, based on how close the ray passes to it.
+  float tc = -dot(ro, rd);
+  if (id != -1 && tc > 0.0 && (id == -2 || tBest > tc)) {
+    float d = length(ro + tc * rd);
+    col += AURA * 0.5 * exp(-max(d - 1.0, 0.0) * 9.0);
+  }
+  return col;
+}
+
+void main() {
+  vec3 acc = vec3(0.0);
+  for (int y = 0; y < 4; y++) {
+    if (y >= uAA) break;
+    for (int x = 0; x < 4; x++) {
+      if (x >= uAA) break;
+      vec2 off = (vec2(x, y) + 0.5) / float(uAA) - 0.5;
+      acc += render(gl_FragCoord.xy + off);
+    }
+  }
+  acc /= float(uAA * uAA);
+  outColor = vec4(pow(acc, vec3(1.0 / 2.2)), 1.0);
+}`;
+
+// Bakes the hemisphere disk (uv in [-1, 1]^2) into one layer of the snapshot texture array.
+const SNAP_FS = `#version 300 es
+precision highp float;
+precision highp int;
+${FRACTAL_GLSL}
+uniform float uSize;
+out vec4 outColor;
+
+void main() {
+  vec3 acc = vec3(0.0);
+  for (int y = 0; y < 2; y++)
+    for (int x = 0; x < 2; x++) {
+      vec2 uv = (gl_FragCoord.xy + (vec2(x, y) + 0.5) * 0.5 - 0.5) / uSize * 2.0 - 1.0;
+      acc += fractalColor(uv);
+    }
+  outColor = vec4(sqrt(acc * 0.25), 1.0);
+}`;
+
+// ---- GL setup ----
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: false });
+if (!gl) {
+  document.body.innerHTML = '<p style="color:#fff;font:16px system-ui;padding:20px">WebGL2 is not available in this browser.</p>';
+  throw new Error('WebGL2 unavailable');
+}
+canvas.addEventListener('webglcontextlost', () => {
+  document.getElementById('status').textContent = 'GPU context lost (render took too long). Reload the page.';
+});
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+function program(fs) {
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  const locs = {};
+  return { prog, u: name => locs[name] ??= gl.getUniformLocation(prog, name) };
+}
+const scene = program(SCENE_FS);
+const baker = program(SNAP_FS);
+gl.bindVertexArray(gl.createVertexArray());
+
+// Texture units: 0 = snapshot array, 1 = reference orbit.
+function makeRefTexture() {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32F, 1, 1, 0, gl.RG, gl.FLOAT, new Float32Array(2));
+  return tex;
+}
+const mainRef = { tex: makeRefTexture(), key: '', len: 1 };
+const snapRef = { tex: makeRefTexture(), key: '', len: 1 };
+
+// Reference orbit Z[0..len] at the disk center, iterated in double precision on the CPU.
+function updateRef(ref, cx, cy, maxIter) {
+  const key = `${cx},${cy},${maxIter}`;
+  if (ref.key === key) return;
+  ref.key = key;
+  const rows = Math.ceil((maxIter + 2) / 1024);
+  const data = new Float32Array(rows * 1024 * 2);
+  let x = 0, y = 0, len = 0;
+  for (let i = 1; i <= maxIter; i++) {
+    const nx = x * x - y * y + cx;
+    y = 2 * x * y + cy;
+    x = nx;
+    data[2 * i] = x; data[2 * i + 1] = y;
+    len = i;
+    if (x * x + y * y > 256) break;
+  }
+  ref.len = len;
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, ref.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32F, 1024, rows, 0, gl.RG, gl.FLOAT, data);
+}
+
+const snapTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, snapTex);
+gl.texStorage3D(gl.TEXTURE_2D_ARRAY, Math.log2(SNAP_SIZE) + 1, gl.RGBA8, SNAP_SIZE, SNAP_SIZE, MAX_SNAPS);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const snapFbo = gl.createFramebuffer();
+
+// ---- Vector helpers ----
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const norm = a => mul(a, 1 / len(a));
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+// ---- Orbit camera ----
+const FOV = 45 * Math.PI / 180;
+const MIN_ALT = 0.002;           // closest the camera may get to the sphere surface
+// Start facing the western hemisphere head-on.
+const DEFAULT = { yaw: Math.PI, pitch: 0.12, dist: 3.8, target: [0, 0, 0] };
+const cam = structuredClone(DEFAULT);
+
+// ---- Fractal view (complex-plane center, radius and rotation of each hemisphere disk) ----
+const FRACTAL_DEFAULT = { center: [-0.75, 0.0], scale: 1.45, angle: 0 };
+const MIN_SCALE = 1e-12;         // CPU reference orbit is plain double precision, so stop here
+const PERTURB_BELOW = 4e-6;      // complex-plane pixel size below which 32-bit floats break down
+const fractal = structuredClone(FRACTAL_DEFAULT);
+
+// Disk coordinate -> offset from fractal.center in the complex plane.
+function diskToPlane(uv) {
+  const c = Math.cos(fractal.angle), s = Math.sin(fractal.angle);
+  return [fractal.scale * (c * uv[0] - s * uv[1]), fractal.scale * (s * uv[0] + c * uv[1])];
+}
+
+// Apply a change to scale/angle while keeping the fractal point at disk coordinate `uv` in place.
+function keepingFixed(uv, change) {
+  const before = diskToPlane(uv);
+  change();
+  const after = diskToPlane(uv);
+  fractal.center = [fractal.center[0] + before[0] - after[0], fractal.center[1] + before[1] - after[1]];
+}
+
+function cameraBasis() {
+  const cp = Math.cos(cam.pitch);
+  const dir = [cp * Math.cos(cam.yaw), Math.sin(cam.pitch), cp * Math.sin(cam.yaw)];
+  let pos = add(cam.target, mul(dir, cam.dist));
+  if (len(pos) < 1 + MIN_ALT) pos = mul(norm(pos), 1 + MIN_ALT);
+  pos[1] = Math.max(pos[1], FLOOR_Y + 0.05);
+  const fwd = norm(sub(cam.target, pos));
+  const right = norm(cross(fwd, [0, 1, 0]));
+  const up = cross(right, fwd);
+  return { pos, fwd, right, up };
+}
+
+// ---- Color cycling ----
+const cycle = { on: false, speed: 0.15, offset: 0 };   // speed in palette periods per second
+const statusEl = document.getElementById('status');
+let statusText = '';
+function updateStatus(perturb) {
+  const zoom = FRACTAL_DEFAULT.scale / fractal.scale;
+  const text = `Color cycling ${cycle.on ? 'on' : 'off'} · speed ${cycle.speed.toFixed(2)} · ` +
+    `zoom ${zoom < 1000 ? zoom.toFixed(1) : zoom.toExponential(1)}× · ` +
+    (perturb ? 'double precision' : 'float precision');
+  if (text !== statusText) statusEl.textContent = statusText = text;
+}
+
+function setFractalUniforms(p, f, ref) {
+  gl.uniform2f(p.u('uCenter'), f.center[0], f.center[1]);
+  gl.uniform1f(p.u('uScale'), f.scale);
+  gl.uniform2f(p.u('uRot'), Math.cos(f.angle), Math.sin(f.angle));
+  gl.uniform1i(p.u('uMaxIter'), f.maxIter);
+  gl.uniform1i(p.u('uPerturb'), f.perturb ? 1 : 0);
+  gl.uniform1f(p.u('uColorOffset'), f.colorOffset);
+  gl.uniform1i(p.u('uRefLen'), ref.len);
+  gl.uniform1i(p.u('uRef'), 1);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, ref.tex);
+}
+
+// ---- Snapshots ----
+// Slots on rings around the main sphere, far enough apart that spheres never overlap.
+const SLOTS = [];
+[[3.2, 8], [5.6, 12], [8.0, 16]].forEach(([r, n], ring) => {
+  for (let i = 0; i < n; i++) {
+    const a = 2 * Math.PI * (i + (ring % 2) * 0.5) / n;
+    SLOTS.push({ pos: [r * Math.cos(a), 0, r * Math.sin(a)], ring });
+  }
+});
+const snapshots = [];   // { pos, layer, slot }
+let snapJob = null;     // baking in progress: { f, layer, slot, row }
+
+// Prefer slots visible beside/behind the main sphere from the current camera, inner rings first.
+function pickSlot() {
+  const used = new Set(snapshots.map(s => s.slot));
+  const cx = Math.cos(cam.yaw), cz = Math.sin(cam.yaw);
+  let best = -1, bestScore = Infinity;
+  SLOTS.forEach((slot, i) => {
+    if (used.has(i)) return;
+    const r = Math.hypot(slot.pos[0], slot.pos[2]);
+    const cosd = (slot.pos[0] * cx + slot.pos[2] * cz) / r;   // 1 = toward camera, -1 = behind main
+    const score = Math.abs(cosd + 0.7) + (cosd < -0.9 ? 1.5 : 0) + (cosd > 0.3 ? 2 : 0) + slot.ring;
+    if (score < bestScore) { bestScore = score; best = i; }
+  });
+  return best;
+}
+
+function takeSnapshot() {
+  if (snapJob) return;
+  if (snapshots.length >= MAX_SNAPS) snapshots.shift();   // recycle the oldest
+  const usedLayers = new Set(snapshots.map(s => s.layer));
+  let layer = 0;
+  while (usedLayers.has(layer)) layer++;
+
+  const maxIter = currentMaxIter();
+  const f = {
+    center: [...fractal.center], scale: fractal.scale, angle: fractal.angle, maxIter,
+    colorOffset: cycle.offset, perturb: fractal.scale * (1 / SNAP_SIZE) < PERTURB_BELOW,
+  };
+  if (f.perturb) updateRef(snapRef, f.center[0], f.center[1], maxIter);
+  // Bake a band of rows per frame, sized to the iteration count, so the GPU never stalls for long.
+  const rowsPerFrame = Math.max(8, Math.min(SNAP_SIZE, Math.floor(3e8 / (SNAP_SIZE * 4 * maxIter))));
+  snapJob = { f, layer, slot: pickSlot(), row: 0, rowsPerFrame };
+  snapBtn.classList.add('busy');
+  document.getElementById('flash').animate([{ opacity: 0.5 }, { opacity: 0 }], { duration: 350 });
+}
+
+function bakeStep() {
+  const job = snapJob;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, snapFbo);
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, snapTex, 0, job.layer);
+  const rows = Math.min(job.rowsPerFrame, SNAP_SIZE - job.row);
+  gl.viewport(0, job.row, SNAP_SIZE, rows);
+  gl.useProgram(baker.prog);
+  setFractalUniforms(baker, job.f, snapRef);
+  gl.uniform1f(baker.u('uSize'), SNAP_SIZE);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  job.row += rows;
+
+  if (job.row >= SNAP_SIZE) {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, snapTex);
+    gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+    snapshots.push({ pos: SLOTS[job.slot].pos, layer: job.layer, slot: job.slot });
+    snapJob = null;
+    snapBtn.classList.remove('busy');
+    dirty = true;
+  }
+}
+
+const snapBtn = document.getElementById('snap');
+snapBtn.addEventListener('click', takeSnapshot);
+
+// ---- Rendering (on demand) ----
+let dirty = true;
+let interacting = false;
+let settleTimer = 0;
+let lastTime = 0;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    dirty = true;
+  }
+}
+
+function cameraAltitude() {
+  return Math.max(len(cameraBasis().pos) - 1, MIN_ALT);
+}
+
+function currentMaxIter() {
+  // Closer to the surface or deeper into the fractal -> more detail visible -> more iterations.
+  const fractalDepth = Math.max(0, Math.log2(FRACTAL_DEFAULT.scale / fractal.scale));
+  return Math.round(Math.min(8000, 300 + 120 * Math.log2(1 / cameraAltitude() + 1) + 100 * fractalDepth));
+}
+
+function draw(now) {
+  const dt = lastTime ? Math.min((now - lastTime) / 1000, 0.1) : 0;
+  lastTime = now;
+  if (cycle.on) {
+    cycle.offset = (cycle.offset + cycle.speed * dt) % 1;
+    dirty = true;
+  }
+  if (snapJob) bakeStep();
+  resize();
+  if (!dirty) return requestAnimationFrame(draw);
+  dirty = false;
+
+  const { pos, fwd, right, up } = cameraBasis();
+  const maxIter = currentMaxIter();
+  // Switch to perturbation only when a pixel spans too little of the complex plane for floats.
+  const pixWorld = 2 * Math.tan(FOV / 2) * cameraAltitude() / canvas.height;
+  const perturb = fractal.scale * pixWorld * 0.5 < PERTURB_BELOW;
+  if (perturb) updateRef(mainRef, fractal.center[0], fractal.center[1], maxIter);
+  updateStatus(perturb);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(scene.prog);
+  setFractalUniforms(scene, { ...fractal, maxIter, perturb, colorOffset: cycle.offset }, mainRef);
+  gl.uniform2f(scene.u('uRes'), canvas.width, canvas.height);
+  gl.uniform3fv(scene.u('uCamPos'), pos);
+  gl.uniform3fv(scene.u('uCamFwd'), fwd);
+  gl.uniform3fv(scene.u('uCamRight'), right);
+  gl.uniform3fv(scene.u('uCamUp'), up);
+  gl.uniform1f(scene.u('uTanHalfFov'), Math.tan(FOV / 2));
+
+  const snapPos = new Float32Array(MAX_SNAPS * 3), snapLayer = new Float32Array(MAX_SNAPS);
+  snapshots.forEach((s, i) => { snapPos.set(s.pos, i * 3); snapLayer[i] = s.layer; });
+  gl.uniform3fv(scene.u('uSnapPos'), snapPos);
+  gl.uniform1fv(scene.u('uSnapLayer'), snapLayer);
+  gl.uniform1i(scene.u('uSnapCount'), snapshots.length);
+  gl.uniform1i(scene.u('uSnaps'), 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, snapTex);
+
+  // Single sample while dragging; 2x2 while animating or at high iteration counts; else 3x3.
+  gl.uniform1i(scene.u('uAA'), interacting ? 1 : (cycle.on || maxIter > 2000) ? 2 : 3);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  requestAnimationFrame(draw);
+}
+
+function changed() {
+  dirty = true;
+  interacting = true;
+  clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => { interacting = false; dirty = true; }, 150);
+}
+
+// ---- Mouse controls ----
+let drag = null;
+
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+canvas.addEventListener('pointerdown', e => {
+  const panning = e.button === 2 || e.button === 1 || e.shiftKey;
+  const mode = e.ctrlKey ? (panning ? 'fpan' : 'frotate') : (panning ? 'pan' : 'orbit');
+  drag = { mode, x: e.clientX, y: e.clientY, side: diskUVAt(e.clientX, e.clientY)?.side };
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add('dragging');
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+
+  if (drag.mode === 'fpan') {
+    // Glue the grabbed fractal point to the cursor, so the pan speed always matches the current
+    // fractal and camera zoom. Stay in the hemisphere where the drag began so crossing the seam is
+    // continuous. Off the sphere, apply the same mouse motion as if dragging at the screen center.
+    let a = diskUVAt(e.clientX - dx, e.clientY - dy, drag.side);
+    let b = diskUVAt(e.clientX, e.clientY, drag.side);
+    if (!a || !b) {
+      const { x, y } = screenCenter();
+      b = diskUVAt(x, y);
+      a = b && diskUVAt(x - dx, y - dy, b.side);
+    }
+    if (a && b) {
+      const pa = diskToPlane(a.uv), pb = diskToPlane(b.uv);
+      fractal.center = [fractal.center[0] + pa[0] - pb[0], fractal.center[1] + pa[1] - pb[1]];
+    }
+    changed();
+    return;
+  }
+
+  if (drag.mode === 'frotate') {
+    // Turn like a dial around the screen center, keeping the fractal point there fixed.
+    const { x, y } = screenCenter();
+    let d = Math.atan2(y - e.clientY, e.clientX - x) - Math.atan2(y - (e.clientY - dy), (e.clientX - dx) - x);
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    const pivot = diskUVAt(x, y)?.uv || [0, 0];
+    keepingFixed(pivot, () => { fractal.angle -= d; });
+    changed();
+    return;
+  }
+
+  if (drag.mode === 'orbit') {
+    // Slow the orbit down near the surface so it stays controllable.
+    const k = 0.005 * Math.min(1, Math.max(cam.dist - 1, 0.02));
+    cam.yaw += dx * k;
+    cam.pitch = Math.max(-1.55, Math.min(1.55, cam.pitch + dy * k));
+  } else {
+    const { right, up } = cameraBasis();
+    const worldPerPx = 2 * cam.dist * Math.tan(FOV / 2) / canvas.clientHeight;
+    cam.target = add(cam.target, add(mul(right, -dx * worldPerPx), mul(up, dy * worldPerPx)));
+  }
+  changed();
+});
+
+const endDrag = () => { drag = null; canvas.classList.remove('dragging'); };
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+
+function screenCenter() {
+  const r = canvas.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+// Same hemisphere mapping as the shader: { uv, side } on the main sphere under a screen pixel,
+// or null if it misses. Pass `forceSide` to keep using one hemisphere's projection past the seam.
+function diskUVAt(clientX, clientY, forceSide) {
+  const { pos, fwd, right, up } = cameraBasis();
+  const r = canvas.getBoundingClientRect();
+  const px = (2 * (clientX - r.left) - r.width) / r.height;
+  const py = -(2 * (clientY - r.top) - r.height) / r.height;
+  const t = Math.tan(FOV / 2);
+  const rd = norm(add(fwd, add(mul(right, px * t), mul(up, py * t))));
+  const b = pos[0] * rd[0] + pos[1] * rd[1] + pos[2] * rd[2];
+  const h = b * b - (len(pos) ** 2 - 1);
+  if (h < 0) return null;
+  const hit = -b - Math.sqrt(h);
+  if (hit < 0) return null;
+  const n = add(pos, mul(rd, hit));
+  const s = forceSide || (n[0] < 0 ? -1 : 1);
+  if (1 + s * n[0] < 0.05) return null;   // too close to the projection point: coordinates explode
+  return { uv: [-s * n[2] / (1 + s * n[0]), n[1] / (1 + s * n[0])], side: s };
+}
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (e.ctrlKey) {
+    // Zoom the fractal about the point under the cursor (disk center if the cursor is off the sphere).
+    const uv = diskUVAt(e.clientX, e.clientY)?.uv || [0, 0];
+    keepingFixed(uv, () => {
+      fractal.scale = Math.min(FRACTAL_DEFAULT.scale * 2,
+                               Math.max(MIN_SCALE, fractal.scale * Math.exp(e.deltaY * 0.0015)));
+    });
+    changed();
+    return;
+  }
+  // Zoom by scaling the distance to the surface, so you can dive in smoothly.
+  const surfaceGap = Math.max(cam.dist - 1, MIN_ALT);
+  const newGap = surfaceGap * Math.exp(e.deltaY * 0.0015);
+  cam.dist = Math.min(40, Math.max(1 + MIN_ALT, 1 + newGap));
+  changed();
+}, { passive: false });
+
+canvas.addEventListener('dblclick', () => {
+  Object.assign(cam, structuredClone(DEFAULT));
+  Object.assign(fractal, structuredClone(FRACTAL_DEFAULT));
+  changed();
+});
+
+// ---- Keyboard: color cycling ----
+window.addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    cycle.on = !cycle.on;
+  } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    // Steps through zero, so going down far enough reverses the direction.
+    cycle.speed = Math.round((cycle.speed + (e.key === 'ArrowUp' ? 0.05 : -0.05)) * 100) / 100;
+    cycle.speed = Math.max(-2, Math.min(2, cycle.speed));
+  } else {
+    return;
+  }
+  dirty = true;
+});
+
+// Remember whether the help panel is collapsed.
+const hud = document.getElementById('hud');
+try { if (localStorage.getItem('hudClosed') === '1') hud.open = false; } catch {}
+hud.addEventListener('toggle', () => {
+  try { localStorage.setItem('hudClosed', hud.open ? '0' : '1'); } catch {}
+});
+
+window.addEventListener('resize', () => { dirty = true; });
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
